@@ -16,7 +16,7 @@ using System.Net; // Added for HttpStatusCode check
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace SifarPriceProcessor // Changed namespace
+namespace SparesPriceProcessor // Changed namespace
 {
     public class DataProcessor
     {

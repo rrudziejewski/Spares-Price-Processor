@@ -10,7 +10,7 @@ using System;
 using System.Collections.Generic; // Required for Dictionary within AppSettings
 using System.Threading.Tasks;
 
-namespace SifarPriceProcessor // Root namespace
+namespace SparesPriceProcessor // Root namespace
 {
     public class Program
     {
