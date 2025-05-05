@@ -361,3 +361,5 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+/Sifar Price Processor.csproj
+/Sifar Price Processor.sln
