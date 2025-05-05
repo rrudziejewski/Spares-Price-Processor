@@ -290,6 +290,8 @@ namespace SparesPriceProcessor // Changed namespace
 
         // --- Updated Excel Parsing Method ---
         // --- Updated Excel Parsing Method with clear mapping logic ---
+        // --- Updated Excel Parsing Method to process all sheets including Promotion Parts ---
+        // --- Updated Excel Parsing Method to process all sheets including Promotion Parts ---
         private List<PriceRecord> ParseExcelData(Stream excelStream, string sourceFileName)
         {
             _logger.LogDebug("Starting Excel parsing for file: {SourceFileName}", sourceFileName);
@@ -303,138 +305,143 @@ namespace SparesPriceProcessor // Changed namespace
                 {
                     _logger.LogDebug("Successfully opened Excel workbook {FileName}", sourceFileName);
 
-                    IXLWorksheet ws = null;
-                    // --- Sheet Selection Logic ---
-                    if (!string.IsNullOrWhiteSpace(mapping.SheetName))
+                    // Get all worksheets from the workbook
+                    var worksheetsCollection = wb.Worksheets;
+                    _logger.LogInformation("Found {SheetCount} worksheets in {FileName}", worksheetsCollection.Count, sourceFileName);
+
+                    // Create a list to hold sheets in specific processing order
+                    var sheetsToProcess = new List<IXLWorksheet>();
+
+                    // Check if there's a specific "Promotion Parts" sheet and add it first if found
+                    var promotionSheet = worksheetsCollection.FirstOrDefault(ws =>
+                        ws.Name.Equals("Promotion Parts", StringComparison.OrdinalIgnoreCase));
+
+                    if (promotionSheet != null)
                     {
-                        // Try to get the sheet by the configured name first
-                        if (wb.Worksheets.TryGetWorksheet(mapping.SheetName, out ws))
+                        _logger.LogInformation("Found 'Promotion Parts' sheet, will prioritize processing it");
+                        sheetsToProcess.Add(promotionSheet);
+                    }
+
+                    // Add all other sheets (excluding Promotion Parts if we already added it)
+                    foreach (var sheet in worksheetsCollection)
+                    {
+                        if (sheet != promotionSheet) // Skip if it's the Promotion Parts sheet we already added
                         {
-                            _logger.LogDebug("Using worksheet specified in config: '{SheetName}'", mapping.SheetName);
+                            sheetsToProcess.Add(sheet);
                         }
-                        else
+                    }
+
+                    // Process each worksheet in our priority order
+                    foreach (var ws in sheetsToProcess)
+                    {
+                        _logger.LogDebug("Processing worksheet: '{WorksheetName}'", ws.Name);
+
+                        // Skip completely empty worksheets
+                        if (ws.IsEmpty())
                         {
-                            // Configured sheet not found, try the first sheet as fallback
-                            ws = wb.Worksheets.FirstOrDefault();
-                            if (ws != null)
+                            _logger.LogWarning("Worksheet '{WorksheetName}' is empty, skipping.", ws.Name);
+                            continue;
+                        }
+
+                        // --- Check header row ---
+                        var headerRow = ws.Row(mapping.HeaderRowIndex);
+                        if (headerRow.IsEmpty())
+                        {
+                            _logger.LogWarning("Header row {HeaderRowIndex} is empty in worksheet '{WorksheetName}', skipping sheet.",
+                                mapping.HeaderRowIndex, ws.Name);
+                            continue;
+                        }
+
+                        // Maps PriceRecord PropertyName -> ColumnIndex
+                        var colMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                        // Maps Excel Header Text -> PriceRecord PropertyName (for logging missing columns)
+                        var reverseMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                        foreach (var kvp in columnConfig) { reverseMap[kvp.Value] = kvp.Key; } // Excel Header -> Property Name
+
+                        foreach (var cell in headerRow.CellsUsed(c => !string.IsNullOrWhiteSpace(c.GetString())))
+                        {
+                            string excelHeader = cell.GetString().Trim();
+                            if (reverseMap.TryGetValue(excelHeader, out var propName))
                             {
-                                _logger.LogWarning("Worksheet '{ConfigSheetName}' not found in {FileName}. Falling back to the first sheet: '{ActualSheetName}'.",
-                                                 mapping.SheetName, sourceFileName, ws.Name);
+                                if (!colMap.ContainsKey(propName)) colMap.Add(propName, cell.Address.ColumnNumber);
+                                else _logger.LogWarning("Duplicate header '{HeaderText}' mapping to '{PropertyName}' found in sheet '{WorksheetName}'. Using first occurrence (Col {ExistingIndex}).",
+                                    excelHeader, propName, ws.Name, colMap[propName]);
                             }
                         }
-                    }
-                    else
-                    {
-                        // No sheet name configured, use the first sheet
-                        ws = wb.Worksheets.FirstOrDefault();
-                        if (ws != null)
+                        _logger.LogDebug("Mapped columns in sheet '{WorksheetName}': {MappedCols}",
+                            ws.Name, string.Join(", ", colMap.Select(kv => $"{kv.Key}->Col{kv.Value}")));
+
+                        // --- Validate Mandatory Columns ---
+                        var requiredProperties = new List<string> {
+                    nameof(PriceRecord.Brand), nameof(PriceRecord.PartNumber),
+                    nameof(PriceRecord.Quantity), nameof(PriceRecord.OfferPrice)
+                };
+                        var missingProps = requiredProperties.Where(p => !colMap.ContainsKey(p)).ToList();
+                        if (missingProps.Any())
                         {
-                            _logger.LogDebug("No sheet name configured. Using first worksheet: '{ActualSheetName}'.", ws.Name);
+                            _logger.LogWarning("Missing required Excel columns for properties: {MissingProps} in sheet '{WorksheetName}' of file {SourceFileName}. Skipping this sheet.",
+                                string.Join(", ", missingProps), ws.Name, sourceFileName);
+                            continue; // Skip this sheet but try others
                         }
-                    }
 
-                    // Check if a worksheet was successfully selected
-                    if (ws == null)
-                    {
-                        _logger.LogError("Could not find a suitable worksheet to process in file {FileName}. Neither configured sheet '{ConfigSheetName}' nor the first sheet was available.",
-                                         sourceFileName, mapping.SheetName ?? "<Not Configured>");
-                        return null; // Critical failure
-                    }
-                    // --- End Sheet Selection Logic ---
+                        // --- Process data rows for this sheet ---
+                        int dataStartRow = mapping.DataStartRowIndex;
+                        int lastRow = ws.LastRowUsed()?.RowNumber() ?? (dataStartRow - 1);
+                        _logger.LogDebug("Processing data rows from {DataStartRow} to {LastRow} in sheet '{WorksheetName}'",
+                            dataStartRow, lastRow, ws.Name);
 
+                        DateTime loadTimestamp = DateTime.UtcNow;
+                        int sheetRecordCount = 0;
 
-                    // --- Find headers and map columns ---
-                    var headerRow = ws.Row(mapping.HeaderRowIndex);
-                    if (headerRow.IsEmpty())
-                    {
-                        _logger.LogError("Header row {HeaderRowIndex} is empty in worksheet '{WorksheetName}' of file {FileName}",
-                                         mapping.HeaderRowIndex, ws.Name, sourceFileName);
-                        return null;
-                    }
-
-                    // MAPPING LOGIC:
-                    // - Excel "Brand" -> PriceRecord.Brand -> SQL "Manufacturer"
-                    // - Excel "P/N" -> PriceRecord.PartNumber -> SQL "Part_Number"
-                    // - Excel "Q.TY" -> PriceRecord.Quantity -> SQL "On_Stock" 
-                    // - Excel "Offer" -> PriceRecord.OfferPrice -> SQL "Price"
-                    // - Excel "Uwagi" -> PriceRecord.Comment -> SQL "Comment"
-                    // - PriceRecord.SourceFileName -> SQL "SourceFileName"
-                    // - PriceRecord.LoadDateTime -> SQL "Import_TimeStamp"
-
-                    // Maps PriceRecord PropertyName -> ColumnIndex
-                    var colMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-                    // Maps Excel Header Text -> PriceRecord PropertyName (for logging missing columns)
-                    var reverseMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-                    foreach (var kvp in columnConfig) { reverseMap[kvp.Value] = kvp.Key; } // Excel Header -> Property Name
-
-                    foreach (var cell in headerRow.CellsUsed(c => !string.IsNullOrWhiteSpace(c.GetString())))
-                    {
-                        string excelHeader = cell.GetString().Trim();
-                        if (reverseMap.TryGetValue(excelHeader, out var propName))
+                        for (int r = dataStartRow; r <= lastRow; r++)
                         {
-                            if (!colMap.ContainsKey(propName)) colMap.Add(propName, cell.Address.ColumnNumber);
-                            else _logger.LogWarning("Duplicate header '{HeaderText}' mapping to '{PropertyName}' found. Using first occurrence (Col {ExistingIndex}).", excelHeader, propName, colMap[propName]);
-                        }
-                    }
-                    _logger.LogDebug("Mapped columns: {MappedCols}", string.Join(", ", colMap.Select(kv => $"{kv.Key}->Col{kv.Value}")));
+                            var row = ws.Row(r);
+                            if (row.IsEmpty()) continue;
 
-                    // --- Validate Mandatory Columns ---
-                    var requiredProperties = new List<string> {
-                nameof(PriceRecord.Brand), nameof(PriceRecord.PartNumber),
-                nameof(PriceRecord.Quantity), nameof(PriceRecord.OfferPrice)
-                // Add other REQUIRED property names based on ExcelMapping.Columns keys
-            };
-                    var missingProps = requiredProperties.Where(p => !colMap.ContainsKey(p)).ToList();
-                    if (missingProps.Any())
-                    {
-                        _logger.LogError("Missing required Excel columns for properties: {MissingProps} in file {SourceFileName}. Check ExcelMapping config & file headers.",
-                                         string.Join(", ", missingProps), sourceFileName);
-                        return null; // Cannot proceed
-                    }
-
-                    // --- Process data rows ---
-                    int dataStartRow = mapping.DataStartRowIndex;
-                    int lastRow = ws.LastRowUsed()?.RowNumber() ?? (dataStartRow - 1);
-                    _logger.LogDebug("Processing data rows from {DataStartRow} to {LastRow}", dataStartRow, lastRow);
-                    DateTime loadTimestamp = DateTime.UtcNow;
-
-                    for (int r = dataStartRow; r <= lastRow; r++)
-                    {
-                        var row = ws.Row(r);
-                        if (row.IsEmpty()) continue;
-
-                        var record = new PriceRecord { LoadDateTime = loadTimestamp, SourceFileName = sourceFileName };
-                        bool isValidRow = true;
-
-                        try
-                        {
-                            // Populate based on mapped columns
-                            record.Brand = GetStringValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.Brand)));
-                            record.PartNumber = GetStringValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.PartNumber)));
-                            record.Quantity = GetIntValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.Quantity)));
-                            record.OfferPrice = GetDecimalValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.OfferPrice)));
-                            record.Comment = GetStringValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.Comment)));
-                            record.Description = GetStringValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.Description)));
-                            // Add other property assignments here based on colMap...
-
-                            // Basic Row Validation
-                            if (string.IsNullOrWhiteSpace(record.PartNumber))
+                            var record = new PriceRecord
                             {
-                                _logger.LogWarning("Skipping row {RowNumber} in {FileName} due to missing PartNumber (P/N).", r, sourceFileName);
+                                LoadDateTime = loadTimestamp,
+                                SourceFileName = $"{sourceFileName}|{ws.Name}" // Include sheet name in source
+                            };
+                            bool isValidRow = true;
+
+                            try
+                            {
+                                // Populate based on mapped columns
+                                record.Brand = GetStringValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.Brand)));
+                                record.PartNumber = GetStringValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.PartNumber)));
+                                record.Quantity = GetIntValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.Quantity)));
+                                record.OfferPrice = GetDecimalValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.OfferPrice)));
+                                record.Comment = GetStringValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.Comment)));
+                                record.Description = GetStringValue(row, colMap.GetValueOrDefault(nameof(PriceRecord.Description)));
+
+                                // Basic Row Validation
+                                if (string.IsNullOrWhiteSpace(record.PartNumber))
+                                {
+                                    _logger.LogWarning("Skipping row {RowNumber} in sheet '{WorksheetName}' of {FileName} due to missing PartNumber.",
+                                        r, ws.Name, sourceFileName);
+                                    isValidRow = false;
+                                }
+                            }
+                            catch (Exception rowEx)
+                            {
+                                _logger.LogError(rowEx, "Error parsing data in row {RowNum} of sheet '{WorksheetName}' in file {FileName}. Skipping row.",
+                                    r, ws.Name, sourceFileName);
                                 isValidRow = false;
                             }
-                            // Add more validation if needed
-                        }
-                        catch (Exception rowEx)
-                        {
-                            _logger.LogError(rowEx, "Error parsing data in row {RowNum} of file {FileName}. Skipping row.", r, sourceFileName);
-                            isValidRow = false;
-                        }
 
-                        if (isValidRow) records.Add(record);
+                            if (isValidRow)
+                            {
+                                records.Add(record);
+                                sheetRecordCount++;
+                            }
+                        } // End row loop
 
-                    } // End row loop
+                        _logger.LogInformation("Successfully parsed {Count} valid records from sheet '{WorksheetName}' in {FileName}",
+                            sheetRecordCount, ws.Name, sourceFileName);
+
+                    } // End worksheet loop
                 } // Dispose workbook
             }
             catch (Exception ex)
@@ -443,7 +450,7 @@ namespace SparesPriceProcessor // Changed namespace
                 return null; // Indicate critical failure
             }
 
-            _logger.LogInformation("Successfully parsed {Count} valid records from {FileName}", records.Count, sourceFileName);
+            _logger.LogInformation("Successfully parsed {Count} total valid records from all sheets in {FileName}", records.Count, sourceFileName);
             return records;
         }
 

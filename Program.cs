@@ -157,11 +157,11 @@ namespace SparesPriceProcessor // Root namespace
         // Properties matching the KEYS in appsettings.json ExcelMapping.Columns
         // and used in DataProcessor.cs
         public string Brand { get; set; }           // From Excel "Brand" column
-        public string PartNumber { get; set; }      // From Excel "P/N" column
-        public int? Quantity { get; set; }          // From Excel "Q.TY" column (nullable int)
-        public decimal? OfferPrice { get; set; }    // From Excel "Offer" column (nullable decimal)
-        public string Comment { get; set; }         // From Excel "Uwagi" column (example)
-        public string Description { get; set; }     // From Excel "Description" column - ADDED
+        public string PartNumber { get; set; }      // From Excel "Part #" column (not "P/N" as in comments)
+        public int? Quantity { get; set; }          // From Excel "QTY" column (not "Q.TY" as in comments)
+        public decimal? OfferPrice { get; set; }    // From Excel "Kolumn1" column (not "Offer" as in comments)
+        public string Comment { get; set; }         // Not explicitly mapped in the provided JSON
+        public string Description { get; set; }     // From Excel "Description" column
 
         // Metadata properties
         public string SourceFileName { get; set; }
